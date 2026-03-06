@@ -1,126 +1,124 @@
 /*
- * YouTube 双字幕 v5.2
+ * YouTube 双字幕 v5.3
  *
- * 核心方案：
- *   请求阶段：把 fmt=srv3 改成 fmt=json3（json3 每条是完整一句，不重叠）
- *   响应阶段：翻译 json3 合成双行返回
- *   响应头：移除 content-encoding 和 content-length，让 App 正确解析
+ * 不改请求格式，响应阶段：
+ * 1. 收到 srv3 后，用同样的 URL 但换成 json3 重新请求一份
+ * 2. 翻译 json3，合成双行
+ * 3. 把合成好的 json3 替换 srv3 返回，同时修正响应头
  *
- * 之前 v4.3 报错的原因：响应头里保留了 content-encoding:gzip
- * 但我们返回的是明文 json，导致 App 解压失败。
- * 这次彻底清理响应头。
+ * 关键：$done 里同时传 body 和正确的 headers
  */
 
 const SEP = "\n❖\n", CHUNK_MAX = 3500;
+
+const url  = $request.url;
+const body = $response.body;
+
+console.log("[YTDual] RESP len=" + (body||"").length + " head=" + (body||"").slice(0,15));
+
+function done(b) {
+  // 必须同时修正这两个响应头，否则 App 解析失败
+  const h = {};
+  for (const k of Object.keys($response.headers || {})) {
+    const kl = k.toLowerCase();
+    if (kl === "content-encoding" || kl === "content-length") continue;
+    h[k] = $response.headers[k];
+  }
+  h["content-type"] = "application/json; charset=UTF-8";
+  $done({ body: b, headers: h });
+}
+
+function passthrough() {
+  $done({ body: body });
+}
+
+if (!body || body.length < 10) { passthrough(); return; }
 
 const ARGS        = parseArgs(typeof $argument !== "undefined" ? $argument : "");
 const TARGET_LANG = ARGS.tl   || "zh-Hans";
 const LAYOUT      = ARGS.line || "f";
 
-// 判断是 request 还是 response
-if (typeof $response === "undefined") {
-  // ── 请求阶段：把任何 fmt 改成 json3 ────────────────────────────────────────
-  const url = $request.url;
-  console.log("[YTDual] REQ " + url.slice(0, 100));
+const params  = parseURLParams(url);
+const videoId = params.v || params.videoId || "";
+if (!videoId) { passthrough(); return; }
 
-  let newUrl = url;
-  // 替换所有 fmt= 或 format= 参数为 json3
-  newUrl = newUrl.replace(/([?&])(fmt|format)=([^&]*)/g, "$1fmt=json3");
-  // 如果完全没有 fmt 参数则追加
-  if (!/[?&]fmt=/.test(newUrl)) newUrl += "&fmt=json3";
+const fmt = detectFormat(body);
+console.log("[YTDual] fmt=" + fmt + " videoId=" + videoId);
 
-  if (newUrl !== url) {
-    console.log("[YTDual] 改为 json3");
-    $done({ url: newUrl });
-  } else {
-    $done({});
-  }
+(async () => {
+  try {
+    const cacheKey     = "YTDual53_" + videoId + "_" + TARGET_LANG;
+    const cacheKeyJ3   = "YTDual53_" + videoId + "_j3";
+    let transMap  = readCache(cacheKey);
+    let j3body    = readCache(cacheKeyJ3);
 
-} else {
-  // ── 响应阶段：翻译并合成双行 ────────────────────────────────────────────────
-  const url  = $request.url;
-  const body = $response.body;
+    if (!transMap || !j3body) {
+      // 构造 json3 URL（把当前 URL 的 fmt 改成 json3）
+      let j3url = url.replace(/([?&])(fmt|format)=([^&]*)/g, "$1fmt=json3");
+      if (!/[?&]fmt=/.test(j3url)) j3url += "&fmt=json3";
+      console.log("[YTDual] 抓 json3: " + j3url.slice(0,120));
 
-  console.log("[YTDual] RESP len=" + (body||"").length + " 前20=" + (body||"").slice(0,20));
-
-  function safeReturn(b) {
-    // 清理响应头，移除 gzip 和 content-length
-    const h = {};
-    for (const k of Object.keys($response.headers || {})) {
-      const kl = k.toLowerCase();
-      if (kl === "content-encoding" || kl === "content-length") continue;
-      h[k] = $response.headers[k];
-    }
-    $done({ body: b || body, headers: h });
-  }
-
-  if (!body || body.length < 10) { safeReturn(body); return; }
-
-  const fmt = detectFormat(body);
-  console.log("[YTDual] fmt=" + fmt);
-
-  // 如果不是 json3 说明请求阶段没有生效，原样返回
-  if (fmt !== "json3") {
-    console.log("[YTDual] 非 json3，原样返回");
-    safeReturn(body);
-    return;
-  }
-
-  const params  = parseURLParams(url);
-  const videoId = params.v || params.videoId || "";
-  if (!videoId) { safeReturn(body); return; }
-
-  (async () => {
-    try {
-      const cacheKey = "YTDual52_" + videoId + "_" + TARGET_LANG;
-      let transMap   = readCache(cacheKey);
-
-      if (!transMap) {
-        // 解析 json3 字幕条目
-        const entries = [];
-        try {
-          const data = JSON.parse(body);
-          for (const e of (data.events || [])) {
-            if (!e.segs) continue;
-            const text = e.segs.map(s => s.utf8||"").join("").replace(/\n/g," ").trim();
-            if (text) entries.push({ key: String(e.tStartMs||0), text });
-          }
-        } catch(e) { console.log("[YTDual] parse err: " + e.message); }
-
-        console.log("[YTDual] entries=" + entries.length);
-        if (!entries.length) { safeReturn(body); return; }
-
-        transMap = await translateAll(entries, TARGET_LANG);
-        console.log("[YTDual] translated=" + Object.keys(transMap).length);
-        if (Object.keys(transMap).length > 0) writeCache(cacheKey, transMap);
-      } else {
-        console.log("[YTDual] cache=" + Object.keys(transMap).length);
+      try {
+        j3body = await httpGet(j3url);
+        console.log("[YTDual] json3 len=" + j3body.length + " head=" + j3body.slice(0,15));
+      } catch(e) {
+        console.log("[YTDual] json3 fetch fail: " + e.message);
+        passthrough(); return;
       }
 
-      // 合成双行
-      let data;
-      try { data = JSON.parse(body); } catch(e) { safeReturn(body); return; }
-
-      let hit = 0;
-      for (const e of (data.events || [])) {
-        if (!e.segs) continue;
-        const orig = e.segs.map(s => s.utf8||"").join("").replace(/\n/g," ").trim();
-        if (!orig) continue;
-        const trans = transMap[String(e.tStartMs)] || fuzzyGet(transMap, e.tStartMs);
-        if (!trans || trans === orig) continue;
-        e.segs = [{ utf8: makeLine(orig, trans, LAYOUT) }];
-        hit++;
+      // 验证是合法 json3
+      if (!j3body.trimStart().startsWith("{")) {
+        console.log("[YTDual] 返回不是 json3: " + j3body.slice(0,50));
+        passthrough(); return;
       }
-      console.log("[YTDual] hit=" + hit + " ✅");
 
-      safeReturn(JSON.stringify(data));
+      // 提取字幕条目
+      const entries = [];
+      try {
+        const data = JSON.parse(j3body);
+        for (const e of (data.events||[])) {
+          if (!e.segs) continue;
+          const text = e.segs.map(s=>s.utf8||"").join("").replace(/\n/g," ").trim();
+          if (text) entries.push({ key: String(e.tStartMs||0), text });
+        }
+      } catch(e) { console.log("[YTDual] json3 parse err: " + e.message); passthrough(); return; }
 
-    } catch(e) {
-      console.log("[YTDual] ERR: " + e.message);
-      safeReturn(body);
+      console.log("[YTDual] entries=" + entries.length);
+      if (!entries.length) { passthrough(); return; }
+
+      transMap = await translateAll(entries, TARGET_LANG);
+      console.log("[YTDual] translated=" + Object.keys(transMap).length);
+
+      if (Object.keys(transMap).length > 0) {
+        writeCache(cacheKey, transMap);
+        writeCache(cacheKeyJ3, j3body);
+      }
+    } else {
+      console.log("[YTDual] cache hit trans=" + Object.keys(transMap).length);
     }
-  })();
-}
+
+    // 合成双行 json3
+    let data;
+    try { data = JSON.parse(j3body); } catch(e) { passthrough(); return; }
+
+    let hit = 0;
+    for (const e of (data.events||[])) {
+      if (!e.segs) continue;
+      const orig = e.segs.map(s=>s.utf8||"").join("").replace(/\n/g," ").trim();
+      if (!orig) continue;
+      const trans = transMap[String(e.tStartMs)] || fuzzyGet(transMap, e.tStartMs);
+      if (!trans || trans === orig) continue;
+      e.segs = [{ utf8: makeLine(orig, trans, LAYOUT) }];
+      hit++;
+    }
+    console.log("[YTDual] hit=" + hit + " ✅");
+    done(JSON.stringify(data));
+
+  } catch(e) {
+    console.log("[YTDual] ERR: " + e.message);
+    passthrough();
+  }
+})();
 
 function makeLine(orig, trans, layout) {
   if (layout === "f")  return trans + "\n" + orig;
@@ -138,7 +136,6 @@ async function translateAll(entries, tl) {
     cur.push(e); curLen += len;
   }
   if (cur.length) chunks.push(cur);
-  console.log("[YTDual] " + chunks.length + " batches");
   for (let ci = 0; ci < chunks.length; ci++) {
     try {
       const t = await googleTranslate(chunks[ci].map(e=>e.text).join(SEP), tl);
@@ -146,8 +143,7 @@ async function translateAll(entries, tl) {
         const c = s.trim();
         if (c && chunks[ci][i]) map[chunks[ci][i].key] = c;
       });
-      console.log("[YTDual] batch" + (ci+1) + " ok");
-    } catch(e) { console.log("[YTDual] batch" + (ci+1) + " fail: " + e.message); }
+    } catch(e) { console.log("[YTDual] batch" + ci + " fail: " + e.message); }
   }
   return map;
 }
@@ -171,11 +167,19 @@ function googleTranslate(text, tl) {
   });
 }
 
+function httpGet(url) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("timeout")), 15000);
+    $httpClient.get({ url, headers:{"User-Agent":"com.google.ios.youtube/19.45.4 (iPhone; iOS 17.0)"} },
+      (err,_r,b) => { clearTimeout(timer); if(err) reject(new Error(String(err))); else resolve(b); });
+  });
+}
+
 function detectFormat(body) {
   const t = (body||"").trimStart();
-  if (t.startsWith("{"))      return "json3";
-  if (t.startsWith("WEBVTT")) return "webvtt";
-  if (t.startsWith("<"))      return "xml";
+  if (t.startsWith("{"))  return "json3";
+  if (t.startsWith("WEB")) return "webvtt";
+  if (t.startsWith("<"))  return "xml";
   return "unknown";
 }
 
