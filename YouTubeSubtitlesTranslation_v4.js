@@ -1,182 +1,144 @@
 /*
- * YouTube 双字幕 v5.1
- *
- * srv3 结构：每两个相邻有内容的 <p> 同时显示
- * 策略：每对 <p> 合并成一句翻译，两个 <p> 都写相同双行内容
- * 出错时原样返回，不报"加载字幕时出错"
+ * YouTube 双字幕 v6.1 - 视觉稳定版
+ * 修复：3行闪烁、中文消失、srv3 乱码
+ * 策略：VTT 语义注入 + 严格标签占位保护
  */
 
 const SEP = "\n❖\n", CHUNK_MAX = 3500;
-
 const url  = $request.url;
 const body = $response.body;
 
-console.log("[YTDual] 触发 len=" + (body||"").length);
-
 function safeReturn(b) { $done({ body: b || body }); }
-
 if (!body || body.length < 10) { safeReturn(body); return; }
 
-const ARGS        = parseArgs(typeof $argument !== "undefined" ? $argument : "");
-const TARGET_LANG = ARGS.tl   || "zh-Hans";
-const LAYOUT      = ARGS.line || "f";
+const ARGS = parseArgs(typeof $argument !== "undefined" ? $argument : "");
+const TARGET_LANG = ARGS.tl || "zh-Hans";
+const LAYOUT = ARGS.line || "f";
 
-const params  = parseURLParams(url);
+const params = parseURLParams(url);
 const videoId = params.v || params.videoId || "";
 if (!videoId) { safeReturn(body); return; }
 
-const fmt = detectFormat(body);
-console.log("[YTDual] fmt=" + fmt + " videoId=" + videoId);
-if (fmt === "unknown") { safeReturn(body); return; }
-
 (async () => {
   try {
-    const cacheKey = "YTDual51_" + videoId + "_" + TARGET_LANG;
-    let transMap   = readCache(cacheKey);
+    const cacheKey = `YTVTT_v61_${videoId}_${TARGET_LANG}`;
+    let transMap = readCache(cacheKey);
 
     if (!transMap) {
-      const entries = extractEntries(body, fmt);
-      console.log("[YTDual] entries=" + entries.length + (entries[0] ? " 首条: " + entries[0].text.slice(0,30) : ""));
+      // 1. 尝试获取完整语义的 VTT 接口
+      const vttUrl = url.replace(/fmt=srv\d/, "fmt=vtt");
+      const vttBody = await fetchVTT(vttUrl);
+      const entries = vttBody ? extractVTT(vttBody) : extractSRV3Entries(body);
+      
       if (!entries.length) { safeReturn(body); return; }
-
       transMap = await translateAll(entries, TARGET_LANG);
-      console.log("[YTDual] translated=" + Object.keys(transMap).length);
       if (Object.keys(transMap).length > 0) writeCache(cacheKey, transMap);
-    } else {
-      console.log("[YTDual] cache=" + Object.keys(transMap).length);
     }
 
-    const result = composeDual(body, fmt, transMap, LAYOUT);
+    // 2. 将翻译注入回原 XML，并处理闪烁问题
+    const result = injectDualStabilized(body, transMap, LAYOUT);
     safeReturn(result);
-
   } catch(e) {
-    console.log("[YTDual] ERR: " + e.message);
+    console.log(`[YTDual] v6.1 Error: ${e.message}`);
     safeReturn(body);
   }
 })();
 
-function extractEntries(body, fmt) {
+// --- 语义提取 ---
+function fetchVTT(vUrl) {
+  return new Promise((resolve) => {
+    $httpClient.get(vUrl, (err, resp, data) => {
+      if (err || !data || !data.includes("WEBVTT")) resolve(null);
+      else resolve(data);
+    });
+  });
+}
+
+function extractVTT(vtt) {
   const entries = [];
-  try {
-    if (fmt === "json3") {
-      const data = JSON.parse(body);
-      for (const e of (data.events || [])) {
-        if (!e.segs) continue;
-        const text = e.segs.map(s => s.utf8||"").join("").replace(/\n/g," ").trim();
-        if (text) entries.push({ key: String(e.tStartMs||0), text });
+  const lines = vtt.split(/\r?\n/);
+  const timeRe = /(\d{2}:\d{2}:\d{2}.\d{3}) --> (\d{2}:\d{2}:\d{2}.\d{3})/;
+  for (let i = 0; i < lines.length; i++) {
+    if (timeRe.test(lines[i])) {
+      let text = (lines[i+1] || "").trim();
+      if (text) {
+        let ms = timeToMs(lines[i].match(timeRe)[1]);
+        entries.push({ key: String(ms), text: decodeHTML(text) });
       }
-      return entries;
     }
-    if (fmt === "xml") {
-      const pList = parseSRV3(body);
-      if (pList.length) {
-        for (let i = 0; i < pList.length; i += 2) {
-          const a = pList[i], b = pList[i+1];
-          const text = b ? a.text + " " + b.text : a.text;
-          entries.push({ key: String(a.ms), text: text.trim() });
-        }
-        return entries;
-      }
-      body.replace(/<text\b[^>]*\bstart="([^"]*)"[^>]*>([\s\S]*?)<\/text>/gi, (_, s, c) => {
-        const ms   = Math.round(parseFloat(s)*1000);
-        const text = decodeHTML(c.replace(/<[^>]+>/g,"")).replace(/\n/g," ").trim();
-        if (text) entries.push({ key: String(ms), text });
-      });
-    }
-  } catch(e) { console.log("[YTDual] extract err: " + e.message); }
+  }
   return entries;
 }
 
-function parseSRV3(body) {
+function extractSRV3Entries(xml) {
   const list = [];
-  const re   = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
+  const re = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
   let m;
-  while ((m = re.exec(body)) !== null) {
-    const attrs = m[1];
-    if (/\ba=["']?1["']?/.test(attrs)) continue;
-    const tM = attrs.match(/\bt="(\d+)"/);
-    const dM = attrs.match(/\bd="(\d+)"/);
-    if (!tM) continue;
+  while ((m = re.exec(xml)) !== null) {
+    const tM = m[1].match(/\bt="(\d+)"/);
     const text = decodeHTML(m[2].replace(/<[^>]+>/g," ")).replace(/\s+/g," ").trim();
-    if (!text) continue;
-    list.push({ ms: +tM[1], dur: +(dM?.[1]||2000), text, full: m[0], attrs, index: m.index });
+    if (tM && text) list.push({ key: tM[1], text });
   }
   return list;
 }
 
-function composeDual(body, fmt, map, layout) {
-  try {
-    if (fmt === "json3") {
-      const data = JSON.parse(body);
-      let hit = 0;
-      for (const e of (data.events||[])) {
-        if (!e.segs) continue;
-        const orig = e.segs.map(s=>s.utf8||"").join("").replace(/\n/g," ").trim();
-        if (!orig) continue;
-        const trans = map[String(e.tStartMs)] || fuzzyGet(map, e.tStartMs);
-        if (!trans || trans === orig) continue;
-        e.segs = [{ utf8: makeLine(orig, trans, layout) }];
-        hit++;
-      }
-      console.log("[YTDual] json3 hit=" + hit);
-      return JSON.stringify(data);
+// --- 核心：稳定注入逻辑 ---
+function injectDualStabilized(xml, map, layout) {
+  const pList = parseSRV3Full(xml);
+  if (!pList.length) return xml;
+  
+  let result = xml;
+  // 记录已合并的时间戳，防止重复渲染
+  const processed = new Set();
+
+  for (let i = 0; i < pList.length; i++) {
+    const p1 = pList[i];
+    if (processed.has(p1.ms)) continue;
+
+    const trans = fuzzyGet(map, p1.ms);
+    if (!trans) continue;
+
+    const p2 = pList[i+1];
+    // 检查 p2 是否是紧随其后的“流式片段”
+    const isFragment = p2 && (p2.ms - p1.ms < 2500);
+
+    const fullOrig = isFragment ? (p1.text + " " + p2.text).trim() : p1.text;
+    const dual = layout === "f" ? `${trans}\n${fullOrig}` : layout === "tl" ? trans : `${fullOrig}\n${trans}`;
+
+    // 更新当前标签
+    const newP = `<p t="${p1.ms}" d="${isFragment ? (p2.ms + p2.dur - p1.ms) : p1.dur}" ${p1.attrs.replace(/\bt="\d+"|\bd="\d+"/g, "").trim()}>${encodeHTML(dual)}</p>`;
+    result = result.replace(p1.full, newP);
+    processed.add(p1.ms);
+
+    if (isFragment) {
+      // 关键：将紧随其后的 p2 彻底抹除，防止 3 行闪烁
+      const emptyP2 = `<p t="${p2.ms}" d="0" ${p2.attrs.replace(/\bt="\d+"|\bd="\d+"/g, "").trim()}></p>`;
+      result = result.replace(p2.full, emptyP2);
+      processed.add(p2.ms);
     }
-    if (fmt === "xml") {
-      const pList = parseSRV3(body);
-      if (!pList.length) {
-        let hit = 0;
-        return body.replace(/<text\b([^>]*\bstart="([^"]*)"[^>]*)>([\s\S]*?)<\/text>/gi,
-          (full, attrs, s, c) => {
-            const ms   = Math.round(parseFloat(s)*1000);
-            const orig = decodeHTML(c.replace(/<[^>]+>/g,"")).replace(/\n/g," ").trim();
-            if (!orig) return full;
-            const trans = map[String(ms)] || fuzzyGet(map, ms);
-            if (!trans || trans === orig) return full;
-            hit++;
-            return "<text" + attrs + ">" + encodeHTML(makeLine(orig, trans, layout)) + "</text>";
-          }
-        );
-      }
-
-      let result = body, delta = 0, hit = 0;
-
-      for (let i = 0; i < pList.length; i += 2) {
-        const first  = pList[i];
-        const second = pList[i+1];
-        const origText = second ? first.text + " " + second.text : first.text;
-        const trans    = map[String(first.ms)] || fuzzyGet(map, first.ms);
-        if (!trans) continue;
-
-        const dualLine = encodeHTML(makeLine(origText.trim(), trans, layout));
-
-        // 两个 <p> 都写相同双行内容
-        const firstNew = "<p" + first.attrs + ">" + dualLine + "</p>";
-        const fi = result.indexOf(first.full, Math.max(0, first.index + delta - 50));
-        if (fi >= 0) {
-          result = result.slice(0, fi) + firstNew + result.slice(fi + first.full.length);
-          delta += firstNew.length - first.full.length;
-          hit++;
-        }
-        if (second) {
-          const secondNew = "<p" + second.attrs + ">" + dualLine + "</p>";
-          const si = result.indexOf(second.full, Math.max(0, second.index + delta - 200));
-          if (si >= 0) {
-            result = result.slice(0, si) + secondNew + result.slice(si + second.full.length);
-            delta += secondNew.length - second.full.length;
-          }
-        }
-      }
-      console.log("[YTDual] srv3 hit=" + hit);
-      return result;
-    }
-  } catch(e) { console.log("[YTDual] compose err: " + e.message); }
-  return body;
+  }
+  return result;
 }
 
-function makeLine(orig, trans, layout) {
-  if (layout === "f")  return trans + "\n" + orig;
-  if (layout === "tl") return trans;
-  return orig + "\n" + trans;
+// --- 工具函数 ---
+function parseSRV3Full(xml) {
+  const list = [];
+  const re = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const attrs = m[1];
+    if (/\ba=["']?1["']?/.test(attrs)) continue;
+    const tM = attrs.match(/\bt="(\d+)"/), dM = attrs.match(/\bd="(\d+)"/);
+    if (!tM) continue;
+    const text = decodeHTML(m[2].replace(/<[^>]+>/g," ")).replace(/\s+/g," ").trim();
+    list.push({ ms: +tM[1], dur: +(dM?.[1]||2000), text, full: m[0], attrs: attrs.trim() });
+  }
+  return list;
+}
+
+function timeToMs(t) {
+  const p = t.split(/:|\./);
+  return (parseInt(p[0])*3600 + parseInt(p[1])*60 + parseInt(p[2]))*1000 + parseInt(p[3]);
 }
 
 async function translateAll(entries, tl) {
@@ -189,82 +151,52 @@ async function translateAll(entries, tl) {
     cur.push(e); curLen += len;
   }
   if (cur.length) chunks.push(cur);
-  for (let ci = 0; ci < chunks.length; ci++) {
+  for (const chunk of chunks) {
     try {
-      const t = await googleTranslate(chunks[ci].map(e=>e.text).join(SEP), tl);
-      t.split(/❖/).forEach((s,i) => {
-        const c = s.trim();
-        if (c && chunks[ci][i]) map[chunks[ci][i].key] = c;
-      });
-    } catch(e) { console.log("[YTDual] batch" + ci + " fail: " + e.message); }
+      const t = await googleTranslate(chunk.map(e=>e.text).join(SEP), tl);
+      t.split(/❖/).forEach((s,i) => { if (chunk[i]) map[chunk[i].key] = s.trim(); });
+    } catch(e) {}
   }
   return map;
 }
 
 function googleTranslate(text, tl) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout")), 15000);
     $httpClient.post({
-      url: "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=" + encodeURIComponent(tl) + "&dt=t&dj=1",
-      headers: { "Content-Type":"application/x-www-form-urlencoded", "User-Agent":"GoogleTranslate/6.29.59279 (iPhone; iOS 15.4; en; iPhone14,2)" },
-      body: "q=" + encodeURIComponent(text),
+      url: `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(tl)}&dt=t&dj=1`,
+      headers: { "Content-Type":"application/x-www-form-urlencoded", "User-Agent":"GoogleTranslate/6.29.59279" },
+      body: `q=${encodeURIComponent(text)}`,
     }, (err,_r,rb) => {
-      clearTimeout(timer);
-      if (err) { reject(new Error(String(err))); return; }
+      if (err) return reject(err);
       try {
         const d = JSON.parse(rb);
-        if (Array.isArray(d.sentences)) resolve(d.sentences.map(s=>s.trans||"").join("").trim());
-        else reject(new Error("bad resp"));
+        resolve(d.sentences.map(s=>s.trans||"").join(""));
       } catch(e) { reject(e); }
     });
   });
 }
 
-function detectFormat(body) {
-  const t = (body||"").trimStart();
-  if (t.startsWith("{"))   return "json3";
-  if (t.startsWith("WEB")) return "webvtt";
-  if (t.startsWith("<"))   return "xml";
-  return "unknown";
-}
-
 function fuzzyGet(map, tMs) {
   const t = Number(tMs);
-  for (const k of Object.keys(map)) {
-    if (Math.abs(Number(k) - t) <= 500) return map[k];
-  }
+  const keys = Object.keys(map).map(Number).sort((a,b)=>a-b);
+  for (let k of keys) { if (t >= k - 500 && t < k + 3500) return map[String(k)]; }
   return null;
 }
 
 function parseURLParams(url) {
-  const obj={}, qi=url.indexOf("?"); if(qi<0) return obj;
+  const obj={}; const qi=url.indexOf("?"); if(qi<0) return obj;
   url.slice(qi+1).split("&").forEach(p=>{
-    const eq=p.indexOf("="); if(eq<0) return;
-    try{obj[decodeURIComponent(p.slice(0,eq))]=decodeURIComponent(p.slice(eq+1));}catch(_){}
+    const eq=p.indexOf("="); if(eq>=0) try{obj[decodeURIComponent(p.slice(0,eq))]=decodeURIComponent(p.slice(eq+1));}catch(_){}
   }); return obj;
 }
 
 function parseArgs(str) {
   const obj={}; if(!str) return obj;
-  str.split("&").forEach(p=>{ const eq=p.indexOf("="); if(eq<0) return;
-    try{obj[decodeURIComponent(p.slice(0,eq))]=decodeURIComponent(p.slice(eq+1));}catch(_){} }); return obj;
+  str.split("&").forEach(p=>{ const eq=p.indexOf("="); if(eq>=0) try{obj[decodeURIComponent(p.slice(0,eq))]=decodeURIComponent(p.slice(eq+1));}catch(_){} });
+  return obj;
 }
 
-function readCache(key) {
-  try { const r=$persistentStore.read(key); return r?JSON.parse(r):null; } catch(_){return null;}
-}
-
-function writeCache(key, obj) {
-  try { $persistentStore.write(JSON.stringify(obj), key); } catch(_){}
-}
-
-function decodeHTML(s) {
-  return (s||"").replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">")
-    .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&nbsp;/g," ")
-    .replace(/&#(\d+);/g,(_,c)=>String.fromCharCode(+c))
-    .replace(/&#x([0-9a-f]+);/gi,(_,h)=>String.fromCharCode(parseInt(h,16)));
-}
-
-function encodeHTML(s) {
-  return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-}
+function readCache(k) { try{return JSON.parse($persistentStore.read(k))}catch(e){return null} }
+function writeCache(k,v) { try{$persistentStore.write(JSON.stringify(v),k)}catch(e){} }
+function decodeHTML(s) { return (s||"").replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&nbsp;/g," ").replace(/&#(\d+);/g,(_,c)=>String.fromCharCode(+c)); }
+function encodeHTML(s) { return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
