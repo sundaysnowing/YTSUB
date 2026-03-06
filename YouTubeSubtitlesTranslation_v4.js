@@ -1,7 +1,7 @@
 /*
- * YouTube 双字幕 v5.8 - VTT 语义注入版
- * 修复：SRV3 导致的断句破碎、消失、位置乱跳
- * 策略：保持 srv3 结构以兼容 App，但在后台拉取 vtt 获取完整语义 
+ * YouTube 双字幕 v5.9 - VTT 语义重构版
+ * 解决：srv3 断句破碎、中文消失、乱码(&#39;)、三行重叠
+ * 策略：后台拉取 VTT 获取完整语义，回填并合并 srv3 标签
  */
 
 const SEP = "\n❖\n", CHUNK_MAX = 3500;
@@ -15,37 +15,36 @@ const ARGS = parseArgs(typeof $argument !== "undefined" ? $argument : "");
 const TARGET_LANG = ARGS.tl || "zh-Hans";
 const LAYOUT = ARGS.line || "f";
 
-// 提取视频 ID 和原始请求参数 
 const params = parseURLParams(url);
 const videoId = params.v || params.videoId || "";
 if (!videoId) { safeReturn(body); return; }
 
 (async () => {
   try {
-    const cacheKey = `YTVTT_${videoId}_${TARGET_LANG}`;
+    const cacheKey = `YTVTT_v59_${videoId}_${TARGET_LANG}`;
     let transMap = readCache(cacheKey);
 
     if (!transMap) {
-      // 核心思路：尝试从 VTT 接口获取更高质量的文本块 
+      // 步骤 1: 异步拉取 VTT 格式获取高质量文本块
       const vttUrl = url.replace(/fmt=srv\d/, "fmt=vtt");
       const vttBody = await fetchVTT(vttUrl);
-      const entries = vttBody ? extractVTT(vttBody) : extractSRV3(body);
+      const entries = vttBody ? extractVTT(vttBody) : extractSRV3Entries(body);
       
       if (!entries.length) { safeReturn(body); return; }
       transMap = await translateAll(entries, TARGET_LANG);
       if (Object.keys(transMap).length > 0) writeCache(cacheKey, transMap);
     }
 
-    // 将 VTT 级别的译文映射回 App 要求的 srv3 XML 
-    const result = injectDual(body, transMap, LAYOUT);
+    // 步骤 2: 将语义注入 srv3 并执行标签合并策略
+    const result = composeDualVTT(body, transMap, LAYOUT);
     safeReturn(result);
   } catch(e) {
-    console.log(`[YTDual] VTT Inject Error: ${e.message}`);
+    console.log(`[YTDual] Error: ${e.message}`);
     safeReturn(body);
   }
 })();
 
-// 拉取 VTT 格式字幕 
+// --- 逻辑：获取与解析 ---
 function fetchVTT(vUrl) {
   return new Promise((resolve) => {
     $httpClient.get(vUrl, (err, resp, data) => {
@@ -55,56 +54,85 @@ function fetchVTT(vUrl) {
   });
 }
 
-// 解析 VTT 获取完整句子 
 function extractVTT(vtt) {
   const entries = [];
   const lines = vtt.split(/\r?\n/);
-  let timestampRe = /(\d{2}:\d{2}:\d{2}.\d{3}) --> (\d{2}:\d{2}:\d{2}.\d{3})/;
+  const timeRe = /(\d{2}:\d{2}:\d{2}.\d{3}) --> (\d{2}:\d{2}:\d{2}.\d{3})/;
   for (let i = 0; i < lines.length; i++) {
-    if (timestampRe.test(lines[i])) {
-      let text = lines[i+1] ? lines[i+1].trim() : "";
+    if (timeRe.test(lines[i])) {
+      let text = (lines[i+1] || "").trim();
       if (text) {
-        let ms = timeToMs(lines[i].match(timestampRe)[1]);
-        entries.push({ key: String(ms), text });
+        let ms = timeToMs(lines[i].match(timeRe)[1]);
+        entries.push({ key: String(ms), text: decodeHTML(text) });
       }
     }
   }
   return entries;
 }
 
-// 解析原始 srv3
-function extractSRV3(xml) {
+function extractSRV3Entries(xml) {
   const list = [];
   const re = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
   let m;
   while ((m = re.exec(xml)) !== null) {
     const tM = m[1].match(/\bt="(\d+)"/);
-    if (!tM) continue;
-    const text = m[2].replace(/<[^>]+>/g," ").trim();
-    if (text) list.push({ key: tM[1], text });
+    const text = decodeHTML(m[2].replace(/<[^>]+>/g," ")).replace(/\s+/g," ").trim();
+    if (tM && text) list.push({ key: tM[1], text });
   }
   return list;
 }
 
-// 注入回 srv3 结构
-function injectDual(xml, map, layout) {
-  const re = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
-  return xml.replace(re, (full, attrs, content) => {
-    const tM = attrs.match(/\bt="(\d+)"/);
-    if (!tM) return full;
-    const trans = fuzzyGet(map, tM[1]);
-    if (!trans) return full;
+// --- 逻辑：合成与合并 ---
+function composeDualVTT(xml, map, layout) {
+  const pList = parseSRV3Full(xml);
+  if (!pList.length) return xml;
+  let result = xml;
+
+  // 策略：每两个 p 标签尝试合并，防止 ASR 导致的断续显示
+  for (let i = 0; i < pList.length; i += 2) {
+    const p1 = pList[i], p2 = pList[i+1];
+    const trans = fuzzyGet(map, p1.ms);
+    if (!trans) continue;
+
+    const fullOrig = p2 ? (p1.text + " " + p2.text).trim() : p1.text;
+    const totalDur = p2 ? (p2.ms + p2.dur - p1.ms) : p1.dur;
     
-    const orig = content.replace(/<[^>]+>/g," ").trim();
-    const dual = layout === "f" ? `${trans}\n${orig}` : layout === "tl" ? trans : `${orig}\n${trans}`;
-    return `<p ${attrs}>${encodeHTML(dual)}</p>`;
-  });
+    // 生成干净的双行文本
+    const dual = layout === "f" ? `${trans}\n${fullOrig}` : layout === "tl" ? trans : `${fullOrig}\n${trans}`;
+    
+    // 覆盖 p1 标签：注入内容，修正时长，防止下一句太快消失
+    const newP1 = `<p t="${p1.ms}" d="${totalDur}" ${p1.attrs.replace(/\bt="\d+"|\bd="\d+"/g, "").trim()}>${encodeHTML(dual)}</p>`;
+    result = result.replace(p1.full, newP1);
+
+    if (p2) {
+      // 物理清空 p2，防止它干扰 p1 的双行显示
+      const emptyP2 = `<p t="${p2.ms}" d="0" ${p2.attrs.replace(/\bt="\d+"|\bd="\d+"/g, "").trim()}></p>`;
+      result = result.replace(p2.full, emptyP2);
+    }
+  }
+  return result;
 }
 
 // --- 工具函数 ---
+function parseSRV3Full(xml) {
+  const list = [];
+  const re = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const attrs = m[1];
+    if (/\ba=["']?1["']?/.test(attrs)) continue;
+    const tM = attrs.match(/\bt="(\d+)"/), dM = attrs.match(/\bd="(\d+)"/);
+    if (!tM) continue;
+    const text = decodeHTML(m[2].replace(/<[^>]+>/g," ")).replace(/\s+/g," ").trim();
+    if (!text) continue;
+    list.push({ ms: +tM[1], dur: +(dM?.[1]||2000), text, full: m[0], attrs: attrs.trim() });
+  }
+  return list;
+}
+
 function timeToMs(t) {
-  const parts = t.split(/:|./);
-  return (parseInt(parts[0])*3600 + parseInt(parts[1])*60 + parseInt(parts[2]))*1000 + parseInt(parts[3]);
+  const p = t.split(/:|\./);
+  return (parseInt(p[0])*3600 + parseInt(p[1])*60 + parseInt(p[2]))*1000 + parseInt(p[3]);
 }
 
 async function translateAll(entries, tl) {
@@ -130,7 +158,7 @@ function googleTranslate(text, tl) {
   return new Promise((resolve, reject) => {
     $httpClient.post({
       url: `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=${encodeURIComponent(tl)}&dt=t&dj=1`,
-      headers: { "Content-Type":"application/x-www-form-urlencoded", "User-Agent":"GoogleTranslate/6.29.59279 (iPhone; iOS 15.4)" },
+      headers: { "Content-Type":"application/x-www-form-urlencoded", "User-Agent":"GoogleTranslate/6.29.59279" },
       body: `q=${encodeURIComponent(text)}`,
     }, (err,_r,rb) => {
       if (err) return reject(err);
@@ -144,10 +172,8 @@ function googleTranslate(text, tl) {
 
 function fuzzyGet(map, tMs) {
   const t = Number(tMs);
-  const keys = Object.keys(map).map(Number).sort((a,b) => a-b);
-  for (let k of keys) {
-    if (t >= k && t < k + 3000) return map[String(k)]; 
-  }
+  const keys = Object.keys(map).map(Number).sort((a,b)=>a-b);
+  for (let k of keys) { if (t >= k && t < k + 3500) return map[String(k)]; }
   return null;
 }
 
@@ -166,4 +192,5 @@ function parseArgs(str) {
 
 function readCache(k) { try{return JSON.parse($persistentStore.read(k))}catch(e){return null} }
 function writeCache(k,v) { try{$persistentStore.write(JSON.stringify(v),k)}catch(e){} }
+function decodeHTML(s) { return (s||"").replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&nbsp;/g," ").replace(/&#(\d+);/g,(_,c)=>String.fromCharCode(+c)); }
 function encodeHTML(s) { return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
