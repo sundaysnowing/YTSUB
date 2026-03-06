@@ -1,0 +1,9 @@
+#!name = YouTube 字幕拦截测试
+#!desc = 只用于测试 Loon 是否成功拦截到字幕请求，不修改任何内容。装完后开 YouTube 字幕，看 Loon 日志有没有 [YTTest] 字样。
+#!version = 1.0.0
+
+[Script]
+http-response ^https?:\/\/www\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YTTest.js,requires-body=true,timeout=10,tag=YT字幕测试
+
+[MITM]
+hostname = www.youtube.com
