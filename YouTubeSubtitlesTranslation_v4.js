@@ -1,7 +1,7 @@
 /*
- * YouTube 双字幕 v6.1 - 视觉稳定版
- * 修复：3行闪烁、中文消失、srv3 乱码
- * 策略：VTT 语义注入 + 严格标签占位保护
+ * YouTube 双字幕 v5.9 - VTT 语义重构版
+ * 解决：srv3 断句破碎、中文消失、乱码(&#39;)、三行重叠
+ * 策略：后台拉取 VTT 获取完整语义，回填并合并 srv3 标签
  */
 
 const SEP = "\n❖\n", CHUNK_MAX = 3500;
@@ -21,11 +21,11 @@ if (!videoId) { safeReturn(body); return; }
 
 (async () => {
   try {
-    const cacheKey = `YTVTT_v61_${videoId}_${TARGET_LANG}`;
+    const cacheKey = `YTVTT_v59_${videoId}_${TARGET_LANG}`;
     let transMap = readCache(cacheKey);
 
     if (!transMap) {
-      // 1. 尝试获取完整语义的 VTT 接口
+      // 步骤 1: 异步拉取 VTT 格式获取高质量文本块
       const vttUrl = url.replace(/fmt=srv\d/, "fmt=vtt");
       const vttBody = await fetchVTT(vttUrl);
       const entries = vttBody ? extractVTT(vttBody) : extractSRV3Entries(body);
@@ -35,16 +35,16 @@ if (!videoId) { safeReturn(body); return; }
       if (Object.keys(transMap).length > 0) writeCache(cacheKey, transMap);
     }
 
-    // 2. 将翻译注入回原 XML，并处理闪烁问题
-    const result = injectDualStabilized(body, transMap, LAYOUT);
+    // 步骤 2: 将语义注入 srv3 并执行标签合并策略
+    const result = composeDualVTT(body, transMap, LAYOUT);
     safeReturn(result);
   } catch(e) {
-    console.log(`[YTDual] v6.1 Error: ${e.message}`);
+    console.log(`[YTDual] Error: ${e.message}`);
     safeReturn(body);
   }
 })();
 
-// --- 语义提取 ---
+// --- 逻辑：获取与解析 ---
 function fetchVTT(vUrl) {
   return new Promise((resolve) => {
     $httpClient.get(vUrl, (err, resp, data) => {
@@ -82,39 +82,32 @@ function extractSRV3Entries(xml) {
   return list;
 }
 
-// --- 核心：稳定注入逻辑 ---
-function injectDualStabilized(xml, map, layout) {
+// --- 逻辑：合成与合并 ---
+function composeDualVTT(xml, map, layout) {
   const pList = parseSRV3Full(xml);
   if (!pList.length) return xml;
-  
   let result = xml;
-  // 记录已合并的时间戳，防止重复渲染
-  const processed = new Set();
 
-  for (let i = 0; i < pList.length; i++) {
-    const p1 = pList[i];
-    if (processed.has(p1.ms)) continue;
-
+  // 策略：每两个 p 标签尝试合并，防止 ASR 导致的断续显示
+  for (let i = 0; i < pList.length; i += 2) {
+    const p1 = pList[i], p2 = pList[i+1];
     const trans = fuzzyGet(map, p1.ms);
     if (!trans) continue;
 
-    const p2 = pList[i+1];
-    // 检查 p2 是否是紧随其后的“流式片段”
-    const isFragment = p2 && (p2.ms - p1.ms < 2500);
-
-    const fullOrig = isFragment ? (p1.text + " " + p2.text).trim() : p1.text;
+    const fullOrig = p2 ? (p1.text + " " + p2.text).trim() : p1.text;
+    const totalDur = p2 ? (p2.ms + p2.dur - p1.ms) : p1.dur;
+    
+    // 生成干净的双行文本
     const dual = layout === "f" ? `${trans}\n${fullOrig}` : layout === "tl" ? trans : `${fullOrig}\n${trans}`;
+    
+    // 覆盖 p1 标签：注入内容，修正时长，防止下一句太快消失
+    const newP1 = `<p t="${p1.ms}" d="${totalDur}" ${p1.attrs.replace(/\bt="\d+"|\bd="\d+"/g, "").trim()}>${encodeHTML(dual)}</p>`;
+    result = result.replace(p1.full, newP1);
 
-    // 更新当前标签
-    const newP = `<p t="${p1.ms}" d="${isFragment ? (p2.ms + p2.dur - p1.ms) : p1.dur}" ${p1.attrs.replace(/\bt="\d+"|\bd="\d+"/g, "").trim()}>${encodeHTML(dual)}</p>`;
-    result = result.replace(p1.full, newP);
-    processed.add(p1.ms);
-
-    if (isFragment) {
-      // 关键：将紧随其后的 p2 彻底抹除，防止 3 行闪烁
+    if (p2) {
+      // 物理清空 p2，防止它干扰 p1 的双行显示
       const emptyP2 = `<p t="${p2.ms}" d="0" ${p2.attrs.replace(/\bt="\d+"|\bd="\d+"/g, "").trim()}></p>`;
       result = result.replace(p2.full, emptyP2);
-      processed.add(p2.ms);
     }
   }
   return result;
@@ -131,6 +124,7 @@ function parseSRV3Full(xml) {
     const tM = attrs.match(/\bt="(\d+)"/), dM = attrs.match(/\bd="(\d+)"/);
     if (!tM) continue;
     const text = decodeHTML(m[2].replace(/<[^>]+>/g," ")).replace(/\s+/g," ").trim();
+    if (!text) continue;
     list.push({ ms: +tM[1], dur: +(dM?.[1]||2000), text, full: m[0], attrs: attrs.trim() });
   }
   return list;
@@ -179,7 +173,7 @@ function googleTranslate(text, tl) {
 function fuzzyGet(map, tMs) {
   const t = Number(tMs);
   const keys = Object.keys(map).map(Number).sort((a,b)=>a-b);
-  for (let k of keys) { if (t >= k - 500 && t < k + 3500) return map[String(k)]; }
+  for (let k of keys) { if (t >= k && t < k + 3500) return map[String(k)]; }
   return null;
 }
 
