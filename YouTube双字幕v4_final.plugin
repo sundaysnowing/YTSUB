@@ -1,11 +1,12 @@
-#!name = YouTube 双字幕 v4.8
-#!desc = 只拦截响应，不修改请求格式。srv3 逐词合并成句后翻译，延长显示时长解决重叠问题。
-#!author = Enhanced v4.8
+#!name = YouTube 双字幕 v5.2
+#!desc = 请求阶段把 srv3 改成 json3，从根源解决多行重叠。响应阶段翻译合成双行。
+#!author = Enhanced v5.2
 #!icon = https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/YouTube.png
-#!version = 4.8.0
+#!version = 5.2.0
 
 [Script]
-http-response ^https?:\/\/www\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YouTubeSubtitlesTranslation_v4.js,requires-body=true,binary-body-mode=false,timeout=30,tag=YT双字幕
+http-request ^https?:\/\/www\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YouTubeSubtitlesTranslation_v4.js,requires-body=false,timeout=10,tag=YT双字幕请求
+http-response ^https?:\/\/www\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YouTubeSubtitlesTranslation_v4.js,requires-body=true,binary-body-mode=false,timeout=30,tag=YT双字幕响应
 
 [Argument]
 key = tl

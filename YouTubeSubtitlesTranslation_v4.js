@@ -1,210 +1,125 @@
 /*
- * YouTube 双字幕 v5.1
+ * YouTube 双字幕 v5.2
  *
- * srv3 结构分析：
- *   - <p t="ms" d="dur" w="1"><s>word</s><s t="offset">word</s>...</p>  ← 有内容的行
- *   - <p t="ms" d="dur" w="1" a="1">\n</p>  ← 空行（过渡用，a="1" 标记）
- *   YouTube 同时显示两个相邻有内容的 <p>，所以会出现两行英文
+ * 核心方案：
+ *   请求阶段：把 fmt=srv3 改成 fmt=json3（json3 每条是完整一句，不重叠）
+ *   响应阶段：翻译 json3 合成双行返回
+ *   响应头：移除 content-encoding 和 content-length，让 App 正确解析
  *
- * 策略：
- *   1. 提取所有有内容的 <p>（忽略 a="1" 的空行）
- *   2. 每两个相邻 <p> 合并成一句翻译
- *   3. 第一个 <p> 写"中文\n英文"，第二个 <p> 清空
- *   4. 空行 <p> 原样保留
+ * 之前 v4.3 报错的原因：响应头里保留了 content-encoding:gzip
+ * 但我们返回的是明文 json，导致 App 解压失败。
+ * 这次彻底清理响应头。
  */
 
 const SEP = "\n❖\n", CHUNK_MAX = 3500;
-
-const url  = $request.url;
-const body = $response.body;
-
-console.log("[YTDual] 触发 len=" + (body||"").length);
-
-function safeReturn(b) { $done({ body: b || body }); }
-
-if (!body || body.length < 10) { safeReturn(body); return; }
 
 const ARGS        = parseArgs(typeof $argument !== "undefined" ? $argument : "");
 const TARGET_LANG = ARGS.tl   || "zh-Hans";
 const LAYOUT      = ARGS.line || "f";
 
-const params  = parseURLParams(url);
-const videoId = params.v || params.videoId || "";
-if (!videoId) { safeReturn(body); return; }
+// 判断是 request 还是 response
+if (typeof $response === "undefined") {
+  // ── 请求阶段：把任何 fmt 改成 json3 ────────────────────────────────────────
+  const url = $request.url;
+  console.log("[YTDual] REQ " + url.slice(0, 100));
 
-const fmt = detectFormat(body);
-console.log("[YTDual] fmt=" + fmt + " videoId=" + videoId);
-if (fmt === "unknown") { safeReturn(body); return; }
+  let newUrl = url;
+  // 替换所有 fmt= 或 format= 参数为 json3
+  newUrl = newUrl.replace(/([?&])(fmt|format)=([^&]*)/g, "$1fmt=json3");
+  // 如果完全没有 fmt 参数则追加
+  if (!/[?&]fmt=/.test(newUrl)) newUrl += "&fmt=json3";
 
-(async () => {
-  try {
-    const cacheKey = "YTDual51_" + videoId + "_" + TARGET_LANG;
-    let transMap   = readCache(cacheKey);
-
-    if (!transMap) {
-      const entries = extractEntries(body, fmt);
-      console.log("[YTDual] entries=" + entries.length + (entries[0] ? " 第一条: " + entries[0].text.slice(0,30) : ""));
-      if (!entries.length) { safeReturn(body); return; }
-
-      transMap = await translateAll(entries, TARGET_LANG);
-      console.log("[YTDual] translated=" + Object.keys(transMap).length);
-      if (Object.keys(transMap).length > 0) writeCache(cacheKey, transMap);
-    } else {
-      console.log("[YTDual] cache=" + Object.keys(transMap).length);
-    }
-
-    const result = composeDual(body, fmt, transMap, LAYOUT);
-    safeReturn(result);
-
-  } catch(e) {
-    console.log("[YTDual] ERR: " + e.message);
-    safeReturn(body);
+  if (newUrl !== url) {
+    console.log("[YTDual] 改为 json3");
+    $done({ url: newUrl });
+  } else {
+    $done({});
   }
-})();
 
-// ══════════════════════════════════════════════════════════════════════════════
-// 提取字幕条目
-// ══════════════════════════════════════════════════════════════════════════════
-function extractEntries(body, fmt) {
-  const entries = [];
-  try {
-    if (fmt === "json3") {
-      const data = JSON.parse(body);
+} else {
+  // ── 响应阶段：翻译并合成双行 ────────────────────────────────────────────────
+  const url  = $request.url;
+  const body = $response.body;
+
+  console.log("[YTDual] RESP len=" + (body||"").length + " 前20=" + (body||"").slice(0,20));
+
+  function safeReturn(b) {
+    // 清理响应头，移除 gzip 和 content-length
+    const h = {};
+    for (const k of Object.keys($response.headers || {})) {
+      const kl = k.toLowerCase();
+      if (kl === "content-encoding" || kl === "content-length") continue;
+      h[k] = $response.headers[k];
+    }
+    $done({ body: b || body, headers: h });
+  }
+
+  if (!body || body.length < 10) { safeReturn(body); return; }
+
+  const fmt = detectFormat(body);
+  console.log("[YTDual] fmt=" + fmt);
+
+  // 如果不是 json3 说明请求阶段没有生效，原样返回
+  if (fmt !== "json3") {
+    console.log("[YTDual] 非 json3，原样返回");
+    safeReturn(body);
+    return;
+  }
+
+  const params  = parseURLParams(url);
+  const videoId = params.v || params.videoId || "";
+  if (!videoId) { safeReturn(body); return; }
+
+  (async () => {
+    try {
+      const cacheKey = "YTDual52_" + videoId + "_" + TARGET_LANG;
+      let transMap   = readCache(cacheKey);
+
+      if (!transMap) {
+        // 解析 json3 字幕条目
+        const entries = [];
+        try {
+          const data = JSON.parse(body);
+          for (const e of (data.events || [])) {
+            if (!e.segs) continue;
+            const text = e.segs.map(s => s.utf8||"").join("").replace(/\n/g," ").trim();
+            if (text) entries.push({ key: String(e.tStartMs||0), text });
+          }
+        } catch(e) { console.log("[YTDual] parse err: " + e.message); }
+
+        console.log("[YTDual] entries=" + entries.length);
+        if (!entries.length) { safeReturn(body); return; }
+
+        transMap = await translateAll(entries, TARGET_LANG);
+        console.log("[YTDual] translated=" + Object.keys(transMap).length);
+        if (Object.keys(transMap).length > 0) writeCache(cacheKey, transMap);
+      } else {
+        console.log("[YTDual] cache=" + Object.keys(transMap).length);
+      }
+
+      // 合成双行
+      let data;
+      try { data = JSON.parse(body); } catch(e) { safeReturn(body); return; }
+
+      let hit = 0;
       for (const e of (data.events || [])) {
         if (!e.segs) continue;
-        const text = e.segs.map(s => s.utf8||"").join("").replace(/\n/g," ").trim();
-        if (text) entries.push({ key: String(e.tStartMs||0), text });
-      }
-      return entries;
-    }
-
-    if (fmt === "xml") {
-      // 收集所有有内容的 <p>（跳过 a="1" 空行）
-      const pList = parseSRV3(body);
-      console.log("[YTDual] pList=" + pList.length);
-
-      if (pList.length) {
-        // 每两个相邻 <p> 合并成一句
-        for (let i = 0; i < pList.length; i += 2) {
-          const a = pList[i];
-          const b = pList[i+1];
-          const text = b ? a.text + " " + b.text : a.text;
-          entries.push({ key: String(a.ms), text: text.trim(), pairEnd: b ? b.ms + b.dur : a.ms + a.dur });
-        }
-        return entries;
-      }
-
-      // srv1 fallback
-      body.replace(/<text\b[^>]*\bstart="([^"]*)"[^>]*>([\s\S]*?)<\/text>/gi, (_, s, c) => {
-        const ms   = Math.round(parseFloat(s)*1000);
-        const text = decodeHTML(c.replace(/<[^>]+>/g,"")).replace(/\n/g," ").trim();
-        if (text) entries.push({ key: String(ms), text });
-      });
-    }
-  } catch(e) { console.log("[YTDual] extract err: " + e.message); }
-  return entries;
-}
-
-// 解析 srv3，返回有内容的 <p> 列表
-function parseSRV3(body) {
-  const list = [];
-  const re   = /<p\b([^>]*)>([\s\S]*?)<\/p>/gi;
-  let m;
-  while ((m = re.exec(body)) !== null) {
-    const attrs = m[1];
-    // 跳过 a="1" 的空行
-    if (/\ba=["']?1["']?/.test(attrs)) continue;
-    const tM = attrs.match(/\bt="(\d+)"/);
-    const dM = attrs.match(/\bd="(\d+)"/);
-    if (!tM) continue;
-    // 提取所有 <s> 的文本
-    const text = decodeHTML(m[2].replace(/<[^>]+>/g," ")).replace(/\s+/g," ").trim();
-    if (!text) continue;
-    list.push({ ms: +tM[1], dur: +(dM?.[1]||2000), text, full: m[0], attrs, index: m.index });
-  }
-  return list;
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// 合成双行
-// ══════════════════════════════════════════════════════════════════════════════
-function composeDual(body, fmt, map, layout) {
-  try {
-    if (fmt === "json3") {
-      const data = JSON.parse(body);
-      let hit = 0;
-      for (const e of (data.events||[])) {
-        if (!e.segs) continue;
-        const orig = e.segs.map(s=>s.utf8||"").join("").replace(/\n/g," ").trim();
+        const orig = e.segs.map(s => s.utf8||"").join("").replace(/\n/g," ").trim();
         if (!orig) continue;
-        const trans = map[String(e.tStartMs)] || fuzzyGet(map, e.tStartMs);
+        const trans = transMap[String(e.tStartMs)] || fuzzyGet(transMap, e.tStartMs);
         if (!trans || trans === orig) continue;
-        e.segs = [{ utf8: makeLine(orig, trans, layout) }];
+        e.segs = [{ utf8: makeLine(orig, trans, LAYOUT) }];
         hit++;
       }
-      console.log("[YTDual] json3 hit=" + hit);
-      return JSON.stringify(data);
+      console.log("[YTDual] hit=" + hit + " ✅");
+
+      safeReturn(JSON.stringify(data));
+
+    } catch(e) {
+      console.log("[YTDual] ERR: " + e.message);
+      safeReturn(body);
     }
-
-    if (fmt === "xml") {
-      const pList = parseSRV3(body);
-      if (!pList.length) {
-        // srv1 fallback
-        let hit = 0;
-        return body.replace(/<text\b([^>]*\bstart="([^"]*)"[^>]*)>([\s\S]*?)<\/text>/gi,
-          (full, attrs, s, c) => {
-            const ms   = Math.round(parseFloat(s)*1000);
-            const orig = decodeHTML(c.replace(/<[^>]+>/g,"")).replace(/\n/g," ").trim();
-            if (!orig) return full;
-            const trans = map[String(ms)] || fuzzyGet(map, ms);
-            if (!trans || trans === orig) return full;
-            hit++;
-            return "<text" + attrs + ">" + encodeHTML(makeLine(orig, trans, layout)) + "</text>";
-          }
-        );
-      }
-
-      let result = body;
-      let delta  = 0;
-      let hit    = 0;
-
-      for (let i = 0; i < pList.length; i += 2) {
-        const first  = pList[i];
-        const second = pList[i+1];
-
-        const origText = second ? first.text + " " + second.text : first.text;
-        const trans    = map[String(first.ms)] || fuzzyGet(map, first.ms);
-        if (!trans) continue;
-
-        const dualLine = encodeHTML(makeLine(origText.trim(), trans, layout));
-
-        // 第一个 <p> 和第二个 <p> 都写相同的双行内容
-        // 这样不管 App 同时显示哪个 <p>，看到的都是同样的两行，不会出现三行
-        const firstNew = "<p" + first.attrs + ">" + dualLine + "</p>";
-        const fi = result.indexOf(first.full, first.index + delta - 50 < 0 ? 0 : first.index + delta - 50);
-        if (fi >= 0) {
-          result = result.slice(0, fi) + firstNew + result.slice(fi + first.full.length);
-          delta += firstNew.length - first.full.length;
-          hit++;
-        }
-
-        if (second) {
-          const secondNew = "<p" + second.attrs + ">" + dualLine + "</p>";
-          const si = result.indexOf(second.full, second.index + delta - 200 < 0 ? 0 : second.index + delta - 200);
-          if (si >= 0) {
-            result = result.slice(0, si) + secondNew + result.slice(si + second.full.length);
-            delta += secondNew.length - second.full.length;
-          }
-        }
-      }
-
-      console.log("[YTDual] srv3 hit=" + hit);
-      return result;
-    }
-  } catch(e) {
-    console.log("[YTDual] compose err: " + e.message);
-  }
-  return body;
+  })();
 }
 
 function makeLine(orig, trans, layout) {
@@ -213,9 +128,6 @@ function makeLine(orig, trans, layout) {
   return orig + "\n" + trans;
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// 批量翻译
-// ══════════════════════════════════════════════════════════════════════════════
 async function translateAll(entries, tl) {
   const map = {};
   const chunks = [];
@@ -234,7 +146,7 @@ async function translateAll(entries, tl) {
         const c = s.trim();
         if (c && chunks[ci][i]) map[chunks[ci][i].key] = c;
       });
-      console.log("[YTDual] batch" + (ci+1) + " ok: " + t.slice(0,30));
+      console.log("[YTDual] batch" + (ci+1) + " ok");
     } catch(e) { console.log("[YTDual] batch" + (ci+1) + " fail: " + e.message); }
   }
   return map;
@@ -253,15 +165,12 @@ function googleTranslate(text, tl) {
       try {
         const d = JSON.parse(rb);
         if (Array.isArray(d.sentences)) resolve(d.sentences.map(s=>s.trans||"").join("").trim());
-        else reject(new Error("bad resp: " + rb.slice(0,50)));
+        else reject(new Error("bad resp"));
       } catch(e) { reject(e); }
     });
   });
 }
 
-// ══════════════════════════════════════════════════════════════════════════════
-// 工具
-// ══════════════════════════════════════════════════════════════════════════════
 function detectFormat(body) {
   const t = (body||"").trimStart();
   if (t.startsWith("{"))      return "json3";
@@ -298,15 +207,4 @@ function readCache(key) {
 
 function writeCache(key, obj) {
   try { $persistentStore.write(JSON.stringify(obj), key); } catch(_){}
-}
-
-function decodeHTML(s) {
-  return (s||"").replace(/&amp;/g,"&").replace(/&lt;/g,"<").replace(/&gt;/g,">")
-    .replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&nbsp;/g," ")
-    .replace(/&#(\d+);/g,(_,c)=>String.fromCharCode(+c))
-    .replace(/&#x([0-9a-f]+);/gi,(_,h)=>String.fromCharCode(parseInt(h,16)));
-}
-
-function encodeHTML(s) {
-  return (s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
