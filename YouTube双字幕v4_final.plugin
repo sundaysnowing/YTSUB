@@ -1,11 +1,15 @@
-#!name = YouTube 双字幕 v5.6
-#!desc = 保持 srv3 格式不变，用 VTT 完整句子翻译，效果接近沉浸式翻译
-#!author = Enhanced v5.6
+#!name = YouTube 双字幕 v6.0
+#!desc = 参考 kelee 方案，拦截 player 请求加 tlang，原文译文精确对齐，彻底解决三行问题
+#!author = Enhanced v6.0
 #!icon = https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/YouTube.png
-#!version = 5.6.0
+#!version = 6.0.0
 
 [Script]
-http-response ^https?:\/\/www\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YouTubeSubtitlesTranslation_v4.js,requires-body=true,binary-body-mode=false,timeout=30,tag=YT双字幕
+# 拦截播放器请求，修改字幕 URL 加 tlang
+http-request ^https?:\/\/(www|m|tv)\.youtube\.com\/youtubei\/v1\/player script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YouTubeSubtitlesTranslation_v4.js,requires-body=true,timeout=20,tag=YT双字幕player请求
+
+# 拦截字幕响应，合并原文和译文
+http-response ^https?:\/\/(www|m)\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YouTubeSubtitlesTranslation_v4.js,requires-body=true,binary-body-mode=false,timeout=30,tag=YT双字幕timedtext响应
 
 [Argument]
 key = tl
@@ -24,4 +28,5 @@ option = s:英文在上 / 中文在下
 option = tl:仅显示中文
 
 [MITM]
-hostname = www.youtube.com
+hostname = www.youtube.com, m.youtube.com, tv.youtube.com
+
