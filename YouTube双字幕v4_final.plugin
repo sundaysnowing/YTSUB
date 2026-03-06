@@ -1,0 +1,27 @@
+#!name = YouTube 双字幕 v4.8
+#!desc = 只拦截响应，不修改请求格式。srv3 逐词合并成句后翻译，延长显示时长解决重叠问题。
+#!author = Enhanced v4.8
+#!icon = https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/YouTube.png
+#!version = 4.8.0
+
+[Script]
+http-response ^https?:\/\/www\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YouTubeSubtitlesTranslation_v4.js,requires-body=true,binary-body-mode=false,timeout=30,tag=YT双字幕
+
+[Argument]
+key = tl
+type = input
+defaultValue = zh-Hans
+label = 目标语言
+desc = zh-Hans 简体中文 / zh-Hant 繁体 / ja 日文 / ko 韩文
+
+[Argument]
+key = line
+type = select
+defaultValue = f
+label = 字幕布局
+option = f:中文在上 / 英文在下
+option = s:英文在上 / 中文在下
+option = tl:仅显示中文
+
+[MITM]
+hostname = www.youtube.com
