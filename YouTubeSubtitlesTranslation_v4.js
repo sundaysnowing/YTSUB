@@ -1,14 +1,14 @@
 /*
- * YouTube 双字幕 v5.6
+ * YouTube 双字幕 v5.7
  *
- * 不改请求格式（App 只认 srv3）
- * 响应阶段：
- *   1. 收到 srv3，去掉 <s> 标签得到每个 <p> 的纯文本
- *   2. 额外抓一份 fmt=vtt（完整句子），作为翻译源
- *   3. 翻译 VTT 的完整句子
- *   4. 把译文按时间戳对应写回 srv3 的每个 <p>
+ * 显示格式：
+ *   中文译文（一行）
+ *   完整英文原句（App 自动换行，可能两行）
  *
- * 效果：App 显示 srv3（不报错），但译文来自完整句子翻译（断句准确）
+ * 实现：
+ *   每两个相邻有内容的 <p> 合并成一句
+ *   第一个 <p> 写 "中文\n完整英文"，时长延长覆盖整句
+ *   第二个 <p> 清空（时长保留，撑住时间轴）
  */
 
 const SEP = "\n❖\n", CHUNK_MAX = 3500;
@@ -19,9 +19,6 @@ function safeReturn(b) { $done({ body: b || body }); }
 
 if (!body || body.length < 10) { safeReturn(body); return; }
 
-const fmt = detectFormat(body);
-if (fmt !== "xml") { safeReturn(body); return; }  // 只处理 srv3/xml
-
 const ARGS        = parseArgs(typeof $argument !== "undefined" ? $argument : "");
 const TARGET_LANG = ARGS.tl   || "zh-Hans";
 const LAYOUT      = ARGS.line || "f";
@@ -30,43 +27,21 @@ const params  = parseURLParams(url);
 const videoId = params.v || params.videoId || "";
 if (!videoId) { safeReturn(body); return; }
 
-// 去掉 <s> 标签
-body = body.replace(/<\/?s\b[^>]*>/g, "");
+const fmt = detectFormat(body);
+if (fmt === "unknown") { safeReturn(body); return; }
+
+// 剥离 <s> 子标签
+if (fmt === "xml") body = body.replace(/<\/?s\b[^>]*>/g, "");
 
 (async () => {
   try {
-    const cacheKey = "YTDual56_" + videoId + "_" + TARGET_LANG;
+    const cacheKey = "YTDual57_" + videoId + "_" + TARGET_LANG;
     let transMap   = readCache(cacheKey);
 
     if (!transMap) {
-      // 抓 VTT 格式（完整句子）
-      const vttUrl = url.replace(/([?&])(fmt|format)=([^&]*)/g, "$1fmt=vtt");
-      console.log("[YTDual] 抓 vtt: " + vttUrl.slice(0, 100));
-
-      let vttBody = "";
-      try {
-        vttBody = await httpGet(vttUrl);
-        console.log("[YTDual] vtt len=" + vttBody.length + " head=" + vttBody.slice(0, 10));
-      } catch(e) {
-        console.log("[YTDual] vtt 失败: " + e.message);
-      }
-
-      let entries = [];
-
-      if (vttBody && vttBody.includes("WEBVTT")) {
-        // 用 VTT 完整句子翻译
-        entries = extractVTT(vttBody);
-        console.log("[YTDual] vtt entries=" + entries.length);
-      }
-
-      if (!entries.length) {
-        // 降级：用 srv3 的 <p> 内容翻译
-        entries = extractSRV3(body);
-        console.log("[YTDual] srv3 entries=" + entries.length);
-      }
-
+      const entries = extractEntries(body, fmt);
+      console.log("[YTDual] entries=" + entries.length);
       if (!entries.length) { safeReturn(body); return; }
-
       transMap = await translateAll(entries, TARGET_LANG);
       console.log("[YTDual] translated=" + Object.keys(transMap).length);
       if (Object.keys(transMap).length > 0) writeCache(cacheKey, transMap);
@@ -74,75 +49,106 @@ body = body.replace(/<\/?s\b[^>]*>/g, "");
       console.log("[YTDual] cache=" + Object.keys(transMap).length);
     }
 
-    const result = composeSRV3(body, transMap, LAYOUT);
-    safeReturn(result);
-
+    safeReturn(composeDual(body, fmt, transMap, LAYOUT));
   } catch(e) {
     console.log("[YTDual] ERR: " + e.message);
     safeReturn(body);
   }
 })();
 
-// ── 从 VTT 提取完整句子 ───────────────────────────────────────────────────────
-function extractVTT(vtt) {
+// ── 提取字幕条目 ──────────────────────────────────────────────────────────────
+// xml：每两个 <p> 合并成一句，key = 第一个 <p> 的时间戳
+function extractEntries(body, fmt) {
   const entries = [];
-  const blocks  = vtt.split(/\n\n+/);
-  for (const block of blocks) {
-    const lines   = block.trim().split("\n");
-    const timeIdx = lines.findIndex(l => l.includes("-->"));
-    if (timeIdx < 0) continue;
-    const timeLine = lines[timeIdx].trim();
-    // 把 VTT 时间戳转成毫秒作为 key
-    const ms = vttTimeToMs(timeLine.split("-->")[0].trim());
-    if (ms < 0) continue;
-    const text = lines.slice(timeIdx + 1).join(" ").replace(/<[^>]+>/g, "").trim();
-    if (text) entries.push({ key: String(ms), text });
+  if (fmt === "json3") {
+    try {
+      const data = JSON.parse(body);
+      for (const e of (data.events||[])) {
+        if (!e.segs) continue;
+        const text = e.segs.map(s=>s.utf8||"").join("").replace(/\n/g," ").trim();
+        if (text) entries.push({ key: String(e.tStartMs||0), text });
+      }
+    } catch(e) {}
+  } else if (fmt === "xml") {
+    const pList = parseSRV3(body);
+    for (let i = 0; i < pList.length; i += 2) {
+      const a = pList[i], b = pList[i+1];
+      const text = b ? (a.text + " " + b.text).trim() : a.text;
+      entries.push({ key: String(a.ms), text });
+    }
   }
   return entries;
 }
 
-function vttTimeToMs(t) {
-  // 支持 HH:MM:SS.mmm 和 MM:SS.mmm
-  const parts = t.split(":");
-  try {
-    if (parts.length === 3) {
-      return (parseInt(parts[0])*3600 + parseInt(parts[1])*60 + parseFloat(parts[2])) * 1000 | 0;
-    } else if (parts.length === 2) {
-      return (parseInt(parts[0])*60 + parseFloat(parts[1])) * 1000 | 0;
-    }
-  } catch(e) {}
-  return -1;
-}
-
-// ── 从 srv3 提取 <p> 文本（降级用）────────────────────────────────────────────
-function extractSRV3(body) {
-  const entries = [];
-  body.replace(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi, (_, attrs, content) => {
+// ── 解析 srv3 有内容的 <p> 列表 ───────────────────────────────────────────────
+function parseSRV3(body) {
+  const list = [];
+  body.replace(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi, (full, attrs, content, offset) => {
     if (/\ba=["']?1["']?/.test(attrs)) return;
     const tM = attrs.match(/\bt="(\d+)"/);
+    const dM = attrs.match(/\bd="(\d+)"/);
     if (!tM) return;
     const text = decodeHTML(content).replace(/\s+/g," ").trim();
-    if (text) entries.push({ key: tM[1], text });
+    if (!text) return;
+    list.push({ ms: +tM[1], dur: +(dM?.[1]||2000), text, full, attrs, offset });
   });
-  return entries;
+  return list;
 }
 
-// ── 把译文写回 srv3 ───────────────────────────────────────────────────────────
-function composeSRV3(body, map, layout) {
-  let hit = 0;
-  const result = body.replace(/<p\b([^>]*)>([\s\S]*?)<\/p>/gi, (full, attrs, content) => {
-    if (/\ba=["']?1["']?/.test(attrs)) return full;
-    const tM = attrs.match(/\bt="(\d+)"/);
-    if (!tM) return full;
-    const orig = decodeHTML(content).replace(/\s+/g," ").trim();
-    if (!orig) return full;
-    const trans = map[tM[1]] || fuzzyGet(map, parseInt(tM[1]));
-    if (!trans) return full;
-    hit++;
-    return "<p" + attrs + ">" + encodeHTML(makeLine(orig, trans, layout)) + "</p>";
-  });
-  console.log("[YTDual] srv3 hit=" + hit);
-  return result;
+// ── 合成双行 ──────────────────────────────────────────────────────────────────
+function composeDual(body, fmt, map, layout) {
+  try {
+    if (fmt === "json3") {
+      const data = JSON.parse(body);
+      for (const e of (data.events||[])) {
+        if (!e.segs) continue;
+        const orig = e.segs.map(s=>s.utf8||"").join("").replace(/\n/g," ").trim();
+        if (!orig) continue;
+        const trans = map[String(e.tStartMs)] || fuzzyGet(map, e.tStartMs);
+        if (trans && trans !== orig) e.segs = [{ utf8: makeLine(orig, trans, layout) }];
+      }
+      return JSON.stringify(data);
+    }
+
+    if (fmt === "xml") {
+      const pList = parseSRV3(body);
+      if (!pList.length) { safeReturn(body); return body; }
+
+      // 建立替换表：full -> newContent
+      const replacements = new Map();
+
+      for (let i = 0; i < pList.length; i += 2) {
+        const first  = pList[i];
+        const second = pList[i+1];
+
+        const fullOrig = second ? (first.text + " " + second.text).trim() : first.text;
+        const trans    = map[String(first.ms)] || fuzzyGet(map, first.ms);
+        if (!trans) continue;
+
+        // 第一个 <p>：延长时长覆盖整句，写 中文\n英文
+        const totalEnd = second ? (second.ms + second.dur) : (first.ms + first.dur);
+        const totalDur = totalEnd - first.ms;
+        const newAttrs = first.attrs.replace(/\bd="[^"]*"/, 'd="' + totalDur + '"');
+        const content  = encodeHTML(makeLine(fullOrig, trans, layout));
+        replacements.set(first.full, "<p" + newAttrs + ">" + content + "</p>");
+
+        // 第二个 <p>：清空内容，保留标签（时间轴占位）
+        if (second) {
+          replacements.set(second.full, "<p" + second.attrs + "></p>");
+        }
+      }
+
+      // 一次性替换
+      let result = body;
+      for (const [oldTag, newTag] of replacements) {
+        result = result.replace(oldTag, newTag);
+      }
+
+      console.log("[YTDual] pairs=" + (pList.length >> 1));
+      return result;
+    }
+  } catch(e) { console.log("[YTDual] compose ERR: " + e.message); }
+  return body;
 }
 
 function makeLine(orig, trans, layout) {
@@ -165,9 +171,7 @@ async function translateAll(entries, tl) {
   for (const chunk of chunks) {
     try {
       const t = await googleTranslate(chunk.map(e=>e.text).join(SEP), tl);
-      t.split(/❖/).forEach((s,i) => {
-        if (chunk[i]) map[chunk[i].key] = s.trim();
-      });
+      t.split(/❖/).forEach((s,i) => { if (chunk[i]) map[chunk[i].key] = s.trim(); });
     } catch(e) { console.log("[YTDual] batch fail: " + e.message); }
   }
   return map;
@@ -183,34 +187,23 @@ function googleTranslate(text, tl) {
     }, (err,_r,rb) => {
       clearTimeout(timer);
       if (err) return reject(new Error(String(err)));
-      try {
-        const d = JSON.parse(rb);
-        resolve(d.sentences.map(s=>s.trans||"").join(""));
-      } catch(e) { reject(e); }
+      try { const d = JSON.parse(rb); resolve(d.sentences.map(s=>s.trans||"").join("")); }
+      catch(e) { reject(e); }
     });
-  });
-}
-
-function httpGet(url) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("timeout")), 15000);
-    $httpClient.get({ url, headers:{"User-Agent":"com.google.ios.youtube/19.45.4 (iPhone; iOS 17.0)"} },
-      (err,_r,b) => { clearTimeout(timer); if(err) reject(new Error(String(err))); else resolve(b); });
   });
 }
 
 // ── 工具 ──────────────────────────────────────────────────────────────────────
 function detectFormat(body) {
   const t = (body||"").trimStart();
-  if (t.startsWith("{"))    return "json3";
-  if (t.startsWith("WEB"))  return "vtt";
-  if (t.startsWith("<"))    return "xml";
+  if (t.startsWith("{")) return "json3";
+  if (t.startsWith("<")) return "xml";
   return "unknown";
 }
 
 function fuzzyGet(map, tMs) {
   const t = Number(tMs);
-  let best = null, bestDiff = 600;
+  let best = null, bestDiff = 400;
   for (const k of Object.keys(map)) {
     const diff = Math.abs(Number(k) - t);
     if (diff < bestDiff) { bestDiff = diff; best = map[k]; }
