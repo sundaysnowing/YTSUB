@@ -1,0 +1,27 @@
+#!name = YouTube 双字幕 v5.3
+#!desc = 响应阶段主动抓 json3，翻译合成双行后替换 srv3 返回，彻底解决多行重叠。
+#!author = Enhanced v5.3
+#!icon = https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/YouTube.png
+#!version = 5.3.0
+
+[Script]
+http-response ^https?:\/\/www\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/refs/heads/main/YouTubeSubtitlesTranslation_v4.js,requires-body=true,binary-body-mode=false,timeout=30,tag=YT双字幕
+
+[Argument]
+key = tl
+type = input
+defaultValue = zh-Hans
+label = 目标语言
+desc = zh-Hans 简体中文 / zh-Hant 繁体 / ja 日文 / ko 韩文
+
+[Argument]
+key = line
+type = select
+defaultValue = f
+label = 字幕布局
+option = f:中文在上 / 英文在下
+option = s:英文在上 / 中文在下
+option = tl:仅显示中文
+
+[MITM]
+hostname = www.youtube.com
