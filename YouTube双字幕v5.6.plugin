@@ -1,0 +1,28 @@
+#!name = YouTube 双字幕 v5.6
+#!desc = 修复 ASR 自动字幕位置乱跳、后半句丢失中文等稳定性问题。
+#!author = sundaysnowing
+#!icon = https://raw.githubusercontent.com/Koolson/Qure/master/IconSet/Color/YouTube.png
+#!version = 5.6.0
+
+[Script]
+# 已更新为你 GitHub 仓库的路径
+http-response ^https?:\/\/www\.youtube\.com\/api\/timedtext script-path=https://raw.githubusercontent.com/sundaysnowing/YTSUB/main/YouTubeSubtitlesTranslation_v5.6.js,requires-body=true,binary-body-mode=false,timeout=30,tag=YT双字幕
+
+[Argument]
+key = tl
+type = input
+defaultValue = zh-Hans
+label = 目标语言
+desc = zh-Hans 简体中文 / zh-Hant 繁体 / ja 日文 / ko 韩文
+
+[Argument]
+key = line
+type = select
+defaultValue = f
+label = 字幕布局
+option = f:中文在上 / 英文在下
+option = s:英文在上 / 中文在下
+option = tl:仅显示中文
+
+[MITM]
+hostname = www.youtube.com
